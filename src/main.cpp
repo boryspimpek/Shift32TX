@@ -42,8 +42,8 @@ AxisCal axis[4] = {
   {11762, 15004, 13383}  // P3
 };
 
-#define RC_MIN 1000
-#define RC_MAX 2000
+#define RC_MIN 500
+#define RC_MAX 2500
 #define RC_CENTER 1500
 #define DEADZONE_RC 75
 
