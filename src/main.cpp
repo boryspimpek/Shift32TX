@@ -7,7 +7,6 @@
 #include <Adafruit_ADS1X15.h>
 
 // ---- KONFIGURACJA ESP-NOW ----
-// Wpisz adres MAC swojego odbiornika (możesz go odczytać wgrywając prosty szkic na drugie ESP)
 uint8_t receiverAddress[] = {0x98, 0x88, 0xE0, 0xD1, 0x82, 0x3C};
 
 struct RCData {
@@ -48,14 +47,18 @@ AxisCal axis[4] = {
 #define RC_CENTER 1500
 #define DEADZONE_RC 75
 
-// Timer dla OLED (odświeżanie ekranu co 200ms, aby nie spowalniać radia)
+// Timer dla OLED
 unsigned long lastDisplayUpdate = 0;
 const int displayInterval = 200;
 
-// Callback wysyłania (opcjonalny, do debugowania)
+// ---- DEBOUNCING DLA PRZYCISKÓW ----
+#define DEBOUNCE_DELAY 50  // 50ms debounce
+unsigned long lastDebounceTime[8] = {0};
+bool lastButtonState[8] = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
+bool buttonState[8] = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
+
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Serial.print("\r\nLast Packet Send Status: ");
-  // Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+  // Opcjonalne logowanie
 }
 
 int mapAxis(int raw, AxisCal &c, bool invert = false) {
@@ -71,12 +74,38 @@ void handleTrim(int button) {
     case 5: trim[CH_THROTTLE] -= TRIM_STEP; break;
     case 6: trim[CH_YAW]      += TRIM_STEP; break;
     case 7: trim[CH_YAW]      -= TRIM_STEP; break;
-    case 2: trim[CH_PITCH]     += TRIM_STEP; break;
-    case 3: trim[CH_PITCH]     -= TRIM_STEP; break;
-    case 0: trim[CH_ROLL]      += TRIM_STEP; break;
-    case 1: trim[CH_ROLL]      -= TRIM_STEP; break;
+    case 2: trim[CH_PITCH]    += TRIM_STEP; break;
+    case 3: trim[CH_PITCH]    -= TRIM_STEP; break;
+    case 0: trim[CH_ROLL]     += TRIM_STEP; break;
+    case 1: trim[CH_ROLL]     -= TRIM_STEP; break;
   }
   for (int i = 0; i < 4; i++) trim[i] = constrain(trim[i], -TRIM_MAX, TRIM_MAX);
+}
+
+void checkButtons() {
+  for (uint8_t i = 0; i < 8; i++) {
+    bool reading = pcf.digitalRead(i);
+    
+    // Jeśli stan się zmienił, resetuj timer
+    if (reading != lastButtonState[i]) {
+      lastDebounceTime[i] = millis();
+    }
+    
+    // Jeśli minął czas debounce i stan jest stabilny
+    if ((millis() - lastDebounceTime[i]) > DEBOUNCE_DELAY) {
+      // Jeśli stan przycisku faktycznie się zmienił
+      if (reading != buttonState[i]) {
+        buttonState[i] = reading;
+        
+        // Reaguj tylko na naciśnięcie (zmiana HIGH -> LOW)
+        if (buttonState[i] == LOW) {
+          handleTrim(i);
+        }
+      }
+    }
+    
+    lastButtonState[i] = reading;
+  }
 }
 
 void setup() {
@@ -101,7 +130,7 @@ void setup() {
 
   // 2. Inicjalizacja I2C i peryferiów
   Wire.begin(21, 22);
-  Wire.setClock(400000); // Przyspieszenie I2C do 400kHz
+  Wire.setClock(400000);
 
   if (!pcf.begin(PCF_ADDR, &Wire)) Serial.println("❌ PCF8574 error");
   for (uint8_t i = 0; i < 8; i++) pcf.pinMode(i, INPUT_PULLUP);
@@ -157,14 +186,8 @@ void loop() {
   // --- WYSYŁANIE ESP-NOW ---
   esp_err_t result = esp_now_send(receiverAddress, (uint8_t *) &myData, sizeof(myData));
 
-  // --- OBSŁUGA PRZYCISKÓW (TRIM) ---
-  for (uint8_t i = 0; i < 8; i++) {
-    if (pcf.digitalRead(i) == LOW) {
-      handleTrim(i);
-      delay(10); // Minimalny debouncing, aby nie blokować radia
-      break;
-    }
-  }
+  // --- OBSŁUGA PRZYCISKÓW Z DEBOUNCINGIEM ---
+  checkButtons();
 
   // --- AKTUALIZACJA WYŚWIETLACZA (Nieblokująca) ---
   if (millis() - lastDisplayUpdate > displayInterval) {
