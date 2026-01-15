@@ -14,6 +14,7 @@ struct RCData {
   int16_t yaw;
   int16_t pitch;
   int16_t roll;
+  bool toggle[5];  // Dodano stany toggle switches
 };
 
 RCData myData;
@@ -27,14 +28,19 @@ esp_now_peer_info_t peerInfo;
 #define ENCODER_CLK 32
 #define ENCODER_DT  33
 
-// Toggle switch
-const int buttons[5] = {26, 27, 14, 13, 5};
+// Toggle switches
+const int toggleButtons[5] = {19, 4, 27, 5, 26};
+
+// Debouncing dla toggle switches
+unsigned long lastToggleDebounceTime[5] = {0};
+bool lastToggleReading[5] = {HIGH, HIGH, HIGH, HIGH, HIGH};
+bool toggleState[5] = {HIGH, HIGH, HIGH, HIGH, HIGH};
 
 // Nowa logika enkodera - odczyt bezpośredni w loop()
 int lastEncoderCLK = HIGH;
 int currentScreen = 0;
 int lastScreen = -1;
-const int MAX_SCREENS = 3;
+const int MAX_SCREENS = 4;  // Zwiększono z 3 na 4
 
 Adafruit_PCF8574 pcf;
 Adafruit_ADS1115 ads;
@@ -44,7 +50,7 @@ Adafruit_SH1106G display(128, 64, &Wire, -1);
 #define RC_MIN 1000
 #define RC_MAX 2000
 #define RC_CENTER 1500
-#define DEADZONE_RC 30
+#define DEADZONE_RC 100
 
 enum { CH_THROTTLE = 0, CH_YAW = 1, CH_ROLL = 2, CH_PITCH = 3 };
 
@@ -107,8 +113,33 @@ void readEncoder() {
   lastEncoderCLK = currentCLK;
 }
 
-// ---- LOGIKA PRZETWARZANIA SYGNAŁU ----
+// ---- FUNKCJA ODCZYTU TOGGLE SWITCHES Z DEBOUNCE ----
+void checkToggleSwitches() {
+  for (int i = 0; i < 5; i++) {
+    bool reading = digitalRead(toggleButtons[i]);
+    
+    // Jeśli stan się zmienił, resetuj timer debounce
+    if (reading != lastToggleReading[i]) {
+      lastToggleDebounceTime[i] = millis();
+    }
+    
+    // Sprawdź czy minął czas debounce
+    if ((millis() - lastToggleDebounceTime[i]) > DEBOUNCE_DELAY) {
+      // Jeśli stan jest stabilny i różny od poprzedniego
+      if (reading != toggleState[i]) {
+        toggleState[i] = reading;
+        // Aktualizuj stan w strukturze danych (LOW = włączony, HIGH = wyłączony)
+        myData.toggle[i] = (toggleState[i] == LOW);
+        
+        Serial.printf("Toggle %d: %s\n", i + 1, myData.toggle[i] ? "ON" : "OFF");
+      }
+    }
+    
+    lastToggleReading[i] = reading;
+  }
+}
 
+// ---- LOGIKA PRZETWARZANIA SYGNAŁU ----
 int processAxis(int channel) {
   int16_t raw = ads.readADC_SingleEnded(channel);
   AxisCal &c = axis[channel];
@@ -175,11 +206,16 @@ void setup() {
   pinMode(ENCODER_CLK, INPUT_PULLUP);
   pinMode(ENCODER_DT, INPUT_PULLUP);
 
+  // Inicjalizacja pinów toggle switches
   for (int i = 0; i < 5; i++) {
-  pinMode(buttons[i], INPUT_PULLUP);
+    pinMode(toggleButtons[i], INPUT_PULLUP);
+    // Odczyt początkowego stanu
+    toggleState[i] = digitalRead(toggleButtons[i]);
+    lastToggleReading[i] = toggleState[i];
+    myData.toggle[i] = (toggleState[i] == LOW);
   }
   
-  // Odczyt początkowego stanu
+  // Odczyt początkowego stanu enkodera
   lastEncoderCLK = digitalRead(ENCODER_CLK);
 
   WiFi.mode(WIFI_STA);
@@ -276,6 +312,39 @@ void drawRateScreen() {
   display.display();
 }
 
+void drawToggleScreen() {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  
+  // === NAGŁÓWEK ===
+  display.setTextSize(1);
+  display.setCursor(15, 0);
+  display.print("TOGGLE SWITCHES");
+  display.drawFastHLine(0, 10, 128, SH110X_WHITE);
+  
+  // === TREŚĆ ===
+  display.setTextSize(1);
+  
+  // Wyświetlanie stanu każdego przełącznika
+  for (int i = 0; i < 5; i++) {
+    display.setCursor(0, 15 + (i * 10));
+    display.printf("SW%d: ", i + 1);
+    
+    // Wizualizacja stanu
+    if (myData.toggle[i]) {
+      display.print("[ON] ");
+      // Prostokąt wypełniony dla ON
+      display.fillRect(50, 15 + (i * 10), 30, 8, SH110X_WHITE);
+    } else {
+      display.print("[OFF] ");
+      // Prostokąt pusty dla OFF
+      display.drawRect(50, 15 + (i * 10), 30, 8, SH110X_WHITE);
+    }
+  }
+  
+  display.display();
+}
+
 void loop() {
   unsigned long currentMillis = millis();
   
@@ -286,6 +355,7 @@ void loop() {
   }
   
   checkButtons();
+  checkToggleSwitches();  // Dodano odczyt toggle switches
 
   // Wysyłanie danych RC
   if (currentMillis - lastSendTime >= sendInterval) {
@@ -303,6 +373,7 @@ void loop() {
       case 0: drawMainScreen(); break;
       case 1: drawTrimScreen(); break;
       case 2: drawRateScreen(); break;
+      case 3: drawToggleScreen(); break;  // Nowy ekran
     }
     lastScreen = currentScreen;
     lastDisplayUpdate = currentMillis;
