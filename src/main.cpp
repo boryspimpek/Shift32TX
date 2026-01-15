@@ -27,16 +27,15 @@ esp_now_peer_info_t peerInfo;
 #define ENCODER_CLK 32
 #define ENCODER_DT  33
 
-volatile int encoderPos = 0;
-int currentScreen = 0; // 0: MAIN, 1: TRIMS, 2: RATES
+// Toggle switch
+const int buttons[5] = {26, 27, 14, 13, 5};
+
+// Nowa logika enkodera - odczyt bezpośredni w loop()
+int lastEncoderCLK = HIGH;
+int currentScreen = 0;
+int lastScreen = -1;
 const int MAX_SCREENS = 3;
 
-// Funkcja przerwania dla enkodera
-void IRAM_ATTR readEncoder() {
-  int dtValue = digitalRead(ENCODER_DT);
-  if (dtValue == HIGH) encoderPos++;
-  else encoderPos--;
-}
 Adafruit_PCF8574 pcf;
 Adafruit_ADS1115 ads;
 Adafruit_SH1106G display(128, 64, &Wire, -1);
@@ -49,7 +48,7 @@ Adafruit_SH1106G display(128, 64, &Wire, -1);
 
 enum { CH_THROTTLE = 0, CH_YAW = 1, CH_ROLL = 2, CH_PITCH = 3 };
 
-// Kalibracja fizyczna drążków (Twoje wartości)
+// Kalibracja fizyczna drążków
 struct AxisCal { int min; int max; int center; bool invert; };
 AxisCal axis[4] = {
   {12065, 15314, 13689, false}, // P0 - Throttle
@@ -73,14 +72,40 @@ float rates[4] = {1.0, 1.0, 1.0, 1.0}; // 1.0 = 100%
 // ---- TIMERY ----
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastSendTime = 0;
+unsigned long lastEncoderRead = 0;
 const int displayInterval = 200;
 const int sendInterval = 20; // 50Hz
+const int encoderInterval = 5; // Odczyt co 5ms
 
 // ---- DEBOUNCING ----
 #define DEBOUNCE_DELAY 50
 unsigned long lastDebounceTime[8] = {0};
 bool lastButtonState[8] = {HIGH};
 bool buttonState[8] = {HIGH};
+
+// ---- FUNKCJA ODCZYTU ENKODERA ----
+void readEncoder() {
+  int currentCLK = digitalRead(ENCODER_CLK);
+  
+  // Wykryj opadające zbocze CLK (jeden pełny krok)
+  if (currentCLK == LOW && lastEncoderCLK == HIGH) {
+    // Sprawdź kierunek
+    if (digitalRead(ENCODER_DT) == LOW) {
+      // Obrót w prawo
+      currentScreen++;
+      if (currentScreen >= MAX_SCREENS) currentScreen = 0;
+    } else {
+      // Obrót w lewo
+      currentScreen--;
+      if (currentScreen < 0) currentScreen = MAX_SCREENS - 1;
+    }
+    
+    Serial.printf("Screen changed to: %d\n", currentScreen);
+    delay(5); // Krótkie opóźnienie dla stabilności
+  }
+  
+  lastEncoderCLK = currentCLK;
+}
 
 // ---- LOGIKA PRZETWARZANIA SYGNAŁU ----
 
@@ -101,14 +126,14 @@ int processAxis(int channel) {
   // 4. Aplikowanie Dual Rates (Zakresów) i Trimmerów
   int finalValue = RC_CENTER + (deflection * rates[channel]) + trim[channel];
 
-  return constrain(finalValue, EXTENDED_MIN, EXTENDED_MAX); // Twardy limit bezpieczeństwa
+  return constrain(finalValue, EXTENDED_MIN, EXTENDED_MAX);
 }
 
 void handleButtons(int button) {
   int ch = -1;
   int dir = 0;
 
-  // Przypisanie przycisków do kanałów (zgodnie z Twoim pierwotnym kodem)
+  // Przypisanie przycisków do kanałów
   if (button == 4) { ch = CH_THROTTLE; dir = 1;  }
   if (button == 5) { ch = CH_THROTTLE; dir = -1; }
   if (button == 6) { ch = CH_YAW;      dir = 1;  }
@@ -119,15 +144,14 @@ void handleButtons(int button) {
   if (button == 1) { ch = CH_ROLL;     dir = -1; }
 
   if (ch != -1) {
-      if (currentScreen == 1) {      // Ekran TRIMÓW
-        trim[ch] = constrain(trim[ch] + (dir * TRIM_STEP), -TRIM_MAX, TRIM_MAX);
-      } 
-      else if (currentScreen == 2) { // Ekran DUAL RATES
-        rates[ch] = constrain(rates[ch] + (dir * RATE_STEP), RATE_MIN, RATE_MAX);
-      }
-      // Na ekranie 0 (MAIN) przyciski mogą być zablokowane, by nic nie zmienić przypadkiem
+    if (currentScreen == 1) {      // Ekran TRIMÓW
+      trim[ch] = constrain(trim[ch] + (dir * TRIM_STEP), -TRIM_MAX, TRIM_MAX);
+    } 
+    else if (currentScreen == 2) { // Ekran DUAL RATES
+      rates[ch] = constrain(rates[ch] + (dir * RATE_STEP), RATE_MIN, RATE_MAX);
     }
   }
+}
 
 void checkButtons() {
   for (uint8_t i = 0; i < 8; i++) {
@@ -147,9 +171,16 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
 
 void setup() {
   Serial.begin(115200);
+  
   pinMode(ENCODER_CLK, INPUT_PULLUP);
   pinMode(ENCODER_DT, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), readEncoder, FALLING);
+
+  for (int i = 0; i < 5; i++) {
+  pinMode(buttons[i], INPUT_PULLUP);
+  }
+  
+  // Odczyt początkowego stanu
+  lastEncoderCLK = digitalRead(ENCODER_CLK);
 
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) return;
@@ -166,6 +197,11 @@ void setup() {
   ads.begin(ADS_ADDR, &Wire);
   ads.setGain(GAIN_ONE);
   display.begin(OLED_ADDR, true);
+  display.clearDisplay();
+  display.display();
+  
+  Serial.println("RC Controller Started");
+  Serial.printf("Initial screen: %d\n", currentScreen);
 }
 
 void drawMainScreen() {
@@ -243,9 +279,15 @@ void drawRateScreen() {
 void loop() {
   unsigned long currentMillis = millis();
   
-  currentScreen = ((encoderPos % MAX_SCREENS) + MAX_SCREENS) % MAX_SCREENS;  // ← POPRAWIONE
+  // Odczyt enkodera co 5ms
+  if (currentMillis - lastEncoderRead >= encoderInterval) {
+    readEncoder();
+    lastEncoderRead = currentMillis;
+  }
+  
   checkButtons();
 
+  // Wysyłanie danych RC
   if (currentMillis - lastSendTime >= sendInterval) {
     myData.throttle = processAxis(CH_THROTTLE);
     myData.yaw      = processAxis(CH_YAW);
@@ -255,13 +297,14 @@ void loop() {
     lastSendTime = currentMillis;
   }
 
-  if (millis() - lastDisplayUpdate > displayInterval) {
+  // Odświeżanie wyświetlacza - tylko gdy ekran się zmienił lub minął interwał
+  if (currentMillis - lastDisplayUpdate > displayInterval || currentScreen != lastScreen) {
     switch(currentScreen) {
       case 0: drawMainScreen(); break;
       case 1: drawTrimScreen(); break;
       case 2: drawRateScreen(); break;
     }
-    // Usunięte duplikujące display.clearDisplay() i display.display()
-    lastDisplayUpdate = millis();
+    lastScreen = currentScreen;
+    lastDisplayUpdate = currentMillis;
   }
 }
