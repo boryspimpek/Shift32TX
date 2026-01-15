@@ -334,11 +334,11 @@ void drawToggleScreen() {
     if (myData.toggle[i]) {
       display.print("[ON] ");
       // Prostokąt wypełniony dla ON
-      display.fillRect(50, 15 + (i * 10), 30, 8, SH110X_WHITE);
+      display.fillRect(60, 15 + (i * 10), 30, 8, SH110X_WHITE);
     } else {
       display.print("[OFF] ");
       // Prostokąt pusty dla OFF
-      display.drawRect(50, 15 + (i * 10), 30, 8, SH110X_WHITE);
+      display.drawRect(60, 15 + (i * 10), 30, 8, SH110X_WHITE);
     }
   }
   
