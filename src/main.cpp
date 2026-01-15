@@ -64,9 +64,11 @@ float rates[4] = {1.0, 1.0, 1.0, 1.0}; // 1.0 = 100%
 
 #define TRIM_STEP 5
 #define TRIM_MAX  150
-#define RATE_STEP 0.05
+#define RATE_STEP 0.10
 #define RATE_MIN  0.2
-#define RATE_MAX  1.2
+#define RATE_MAX  2.0
+#define EXTENDED_MIN 500
+#define EXTENDED_MAX 2500
 
 // ---- TIMERY ----
 unsigned long lastDisplayUpdate = 0;
@@ -99,7 +101,7 @@ int processAxis(int channel) {
   // 4. Aplikowanie Dual Rates (Zakresów) i Trimmerów
   int finalValue = RC_CENTER + (deflection * rates[channel]) + trim[channel];
 
-  return constrain(finalValue, 1000, 2000); // Twardy limit bezpieczeństwa
+  return constrain(finalValue, EXTENDED_MIN, EXTENDED_MAX); // Twardy limit bezpieczeństwa
 }
 
 void handleButtons(int button) {
