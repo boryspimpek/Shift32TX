@@ -19,179 +19,247 @@ struct RCData {
 RCData myData;
 esp_now_peer_info_t peerInfo;
 
-// ---- Reszta Twoich ustawień ----
+// ---- PINY I ADRESY ----
 #define PCF_ADDR 0x20
 #define ADS_ADDR 0x48
 #define OLED_ADDR 0x3C
+// Piny enkodera
+#define ENCODER_CLK 32
+#define ENCODER_DT  33
 
+volatile int encoderPos = 0;
+int currentScreen = 0; // 0: MAIN, 1: TRIMS, 2: RATES
+const int MAX_SCREENS = 3;
+
+// Funkcja przerwania dla enkodera
+void IRAM_ATTR readEncoder() {
+  int dtValue = digitalRead(ENCODER_DT);
+  if (dtValue == HIGH) encoderPos++;
+  else encoderPos--;
+}
 Adafruit_PCF8574 pcf;
 Adafruit_ADS1115 ads;
 Adafruit_SH1106G display(128, 64, &Wire, -1);
 
-#define TRIM_STEP 5
-#define TRIM_MAX  100
-int trim[4] = {0, 0, 0, 0};
+// ---- USTAWIENIA KANAŁÓW ----
+#define RC_MIN 1000
+#define RC_MAX 2000
+#define RC_CENTER 1500
+#define DEADZONE_RC 30
 
 enum { CH_THROTTLE = 0, CH_YAW = 1, CH_ROLL = 2, CH_PITCH = 3 };
 
-struct AxisCal { int min; int max; int center; };
+// Kalibracja fizyczna drążków (Twoje wartości)
+struct AxisCal { int min; int max; int center; bool invert; };
 AxisCal axis[4] = {
-  {12065, 15314, 13689}, // P0
-  {11431, 14685, 13058}, // P1
-  {12042, 15571, 13806}, // P2
-  {11762, 15004, 13383}  // P3
+  {12065, 15314, 13689, false}, // P0 - Throttle
+  {11431, 14685, 13058, true},  // P1 - Yaw
+  {12042, 15571, 13806, true},  // P2 - Roll
+  {11762, 15004, 13383, true}   // P3 - Pitch
 };
 
-#define RC_MIN 500
-#define RC_MAX 2500
-#define RC_CENTER 1500
-#define DEADZONE_RC 75
+// ---- TRYMY I ZAKRESY (D/R) ----
+int trim[4] = {0, 0, 0, 0};
+float rates[4] = {1.0, 1.0, 1.0, 1.0}; // 1.0 = 100%
 
-// Timer dla OLED
+#define TRIM_STEP 5
+#define TRIM_MAX  150
+#define RATE_STEP 0.05
+#define RATE_MIN  0.2
+#define RATE_MAX  1.2
+
+// ---- TIMERY ----
 unsigned long lastDisplayUpdate = 0;
+unsigned long lastSendTime = 0;
 const int displayInterval = 200;
+const int sendInterval = 20; // 50Hz
 
-// ---- DEBOUNCING DLA PRZYCISKÓW ----
-#define DEBOUNCE_DELAY 50  // 50ms debounce
+// ---- DEBOUNCING ----
+#define DEBOUNCE_DELAY 50
 unsigned long lastDebounceTime[8] = {0};
-bool lastButtonState[8] = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
-bool buttonState[8] = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
+bool lastButtonState[8] = {HIGH};
+bool buttonState[8] = {HIGH};
 
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Opcjonalne logowanie
-}
+// ---- LOGIKA PRZETWARZANIA SYGNAŁU ----
 
-int mapAxis(int raw, AxisCal &c, bool invert = false) {
+int processAxis(int channel) {
+  int16_t raw = ads.readADC_SingleEnded(channel);
+  AxisCal &c = axis[channel];
+
+  // 1. Mapowanie surowe do zakresu 1000-2000
   raw = constrain(raw, c.min, c.max);
-  long mapped = invert ? map(raw, c.min, c.max, RC_MAX, RC_MIN) : map(raw, c.min, c.max, RC_MIN, RC_MAX);
+  long mapped = c.invert ? map(raw, c.min, c.max, RC_MAX, RC_MIN) : map(raw, c.min, c.max, RC_MIN, RC_MAX);
+
+  // 2. Martwa strefa na środku
   if (abs(mapped - RC_CENTER) < DEADZONE_RC) mapped = RC_CENTER;
-  return mapped;
+
+  // 3. Obliczanie wychylenia od środka
+  int deflection = mapped - RC_CENTER;
+
+  // 4. Aplikowanie Dual Rates (Zakresów) i Trimmerów
+  int finalValue = RC_CENTER + (deflection * rates[channel]) + trim[channel];
+
+  return constrain(finalValue, 1000, 2000); // Twardy limit bezpieczeństwa
 }
 
-void handleTrim(int button) {
-  switch (button) {
-    case 4: trim[CH_THROTTLE] += TRIM_STEP; break;
-    case 5: trim[CH_THROTTLE] -= TRIM_STEP; break;
-    case 6: trim[CH_YAW]      += TRIM_STEP; break;
-    case 7: trim[CH_YAW]      -= TRIM_STEP; break;
-    case 2: trim[CH_PITCH]    += TRIM_STEP; break;
-    case 3: trim[CH_PITCH]    -= TRIM_STEP; break;
-    case 0: trim[CH_ROLL]     += TRIM_STEP; break;
-    case 1: trim[CH_ROLL]     -= TRIM_STEP; break;
+void handleButtons(int button) {
+  int ch = -1;
+  int dir = 0;
+
+  // Przypisanie przycisków do kanałów (zgodnie z Twoim pierwotnym kodem)
+  if (button == 4) { ch = CH_THROTTLE; dir = 1;  }
+  if (button == 5) { ch = CH_THROTTLE; dir = -1; }
+  if (button == 6) { ch = CH_YAW;      dir = 1;  }
+  if (button == 7) { ch = CH_YAW;      dir = -1; }
+  if (button == 2) { ch = CH_PITCH;    dir = 1;  }
+  if (button == 3) { ch = CH_PITCH;    dir = -1; }
+  if (button == 0) { ch = CH_ROLL;     dir = 1;  }
+  if (button == 1) { ch = CH_ROLL;     dir = -1; }
+
+  if (ch != -1) {
+      if (currentScreen == 1) {      // Ekran TRIMÓW
+        trim[ch] = constrain(trim[ch] + (dir * TRIM_STEP), -TRIM_MAX, TRIM_MAX);
+      } 
+      else if (currentScreen == 2) { // Ekran DUAL RATES
+        rates[ch] = constrain(rates[ch] + (dir * RATE_STEP), RATE_MIN, RATE_MAX);
+      }
+      // Na ekranie 0 (MAIN) przyciski mogą być zablokowane, by nic nie zmienić przypadkiem
+    }
   }
-  for (int i = 0; i < 4; i++) trim[i] = constrain(trim[i], -TRIM_MAX, TRIM_MAX);
-}
 
 void checkButtons() {
   for (uint8_t i = 0; i < 8; i++) {
     bool reading = pcf.digitalRead(i);
-    
-    // Jeśli stan się zmienił, resetuj timer
-    if (reading != lastButtonState[i]) {
-      lastDebounceTime[i] = millis();
-    }
-    
-    // Jeśli minął czas debounce i stan jest stabilny
+    if (reading != lastButtonState[i]) lastDebounceTime[i] = millis();
     if ((millis() - lastDebounceTime[i]) > DEBOUNCE_DELAY) {
-      // Jeśli stan przycisku faktycznie się zmienił
       if (reading != buttonState[i]) {
         buttonState[i] = reading;
-        
-        // Reaguj tylko na naciśnięcie (zmiana HIGH -> LOW)
-        if (buttonState[i] == LOW) {
-          handleTrim(i);
-        }
+        if (buttonState[i] == LOW) handleButtons(i);
       }
     }
-    
     lastButtonState[i] = reading;
   }
 }
 
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+
 void setup() {
   Serial.begin(115200);
-  
-  // 1. Inicjalizacja WiFi i ESP-NOW
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), readEncoder, FALLING);
+
   WiFi.mode(WIFI_STA);
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
-  }
+  if (esp_now_init() != ESP_OK) return;
   esp_now_register_send_cb(onDataSent);
-  
   memcpy(peerInfo.peer_addr, receiverAddress, 6);
   peerInfo.channel = 0;  
   peerInfo.encrypt = false;
-  
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add peer");
-    return;
-  }
+  esp_now_add_peer(&peerInfo);
 
-  // 2. Inicjalizacja I2C i peryferiów
   Wire.begin(21, 22);
   Wire.setClock(400000);
-
-  if (!pcf.begin(PCF_ADDR, &Wire)) Serial.println("❌ PCF8574 error");
+  pcf.begin(PCF_ADDR, &Wire);
   for (uint8_t i = 0; i < 8; i++) pcf.pinMode(i, INPUT_PULLUP);
-
-  if (!ads.begin(ADS_ADDR, &Wire)) Serial.println("❌ ADS1115 error");
+  ads.begin(ADS_ADDR, &Wire);
   ads.setGain(GAIN_ONE);
+  display.begin(OLED_ADDR, true);
+}
 
-  if (!display.begin(OLED_ADDR, true)) Serial.println("❌ OLED error");
+void drawMainScreen() {
   display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  
+  // === NAGŁÓWEK ===
+  display.setTextSize(1);
+  display.setCursor(10, 0);
+  display.print("MAIN: 4CH SENDING");
+  display.drawFastHLine(0, 10, 128, SH110X_WHITE);
+
+  // === TREŚĆ ===
+  display.setTextSize(1);
+  display.setCursor(0, 15);
+  display.printf("T:%4d R:%3d%% Tr:%+4d", myData.throttle, (int)(rates[0]*100), trim[0]);
+  display.setCursor(0, 25);
+  display.printf("Y:%4d R:%3d%% Tr:%+4d", myData.yaw,      (int)(rates[1]*100), trim[1]);
+  display.setCursor(0, 35);
+  display.printf("P:%4d R:%3d%% Tr:%+4d", myData.pitch,    (int)(rates[3]*100), trim[3]);
+  display.setCursor(0, 45);
+  display.printf("R:%4d R:%3d%% Tr:%+4d", myData.roll,     (int)(rates[2]*100), trim[2]);
+
   display.display();
 }
 
-void updateOLED() {
+void drawTrimScreen() {
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
   
-  display.setCursor(32, 0);
-  display.print("- RC SENDING -");
+  // === NAGŁÓWEK ===
+  display.setTextSize(1);
+  display.setCursor(25, 0);
+  display.print("EDIT: TRIMS");
   display.drawFastHLine(0, 10, 128, SH110X_WHITE);
+  
+  // === TREŚĆ ===
+  display.setTextSize(1);
+  display.setCursor(0, 15);
+  display.printf("Throttle: %+4d", trim[CH_THROTTLE]);
+  display.setCursor(0, 25);
+  display.printf("Yaw:      %+4d", trim[CH_YAW]);
+  display.setCursor(0, 35);
+  display.printf("Pitch:    %+4d", trim[CH_PITCH]);
+  display.setCursor(0, 45);
+  display.printf("Roll:     %+4d", trim[CH_ROLL]);
+  
+  display.display();
+}
 
-  display.setCursor(0, 18);
-  display.print("THR: "); display.print(myData.throttle);
-  display.setCursor(0, 28);
-  display.print("YAW: "); display.print(myData.yaw);
-
-  display.setCursor(68, 18);
-  display.print("PIT: "); display.print(myData.pitch);
-  display.setCursor(68, 28);
-  display.print("ROL: "); display.print(myData.roll);
-
-  display.drawFastHLine(0, 42, 128, SH110X_WHITE);
-  display.setCursor(0, 48);
-  display.print("TRIMS: ");
-  display.setCursor(0, 57);
-  display.printf("T:%d Y:%d P:%d R:%d", trim[CH_THROTTLE], trim[CH_YAW], trim[CH_PITCH], trim[CH_ROLL]);
+void drawRateScreen() {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  
+  // === NAGŁÓWEK ===
+  display.setTextSize(1);
+  display.setCursor(15, 0);
+  display.print("EDIT: DUAL RATES");
+  display.drawFastHLine(0, 10, 128, SH110X_WHITE);
+  
+  // === TREŚĆ ===
+  display.setTextSize(1);
+  display.setCursor(0, 15);
+  display.printf("Throttle: %3d%%", (int)(rates[CH_THROTTLE]*100));
+  display.setCursor(0, 25);
+  display.printf("Yaw:      %3d%%", (int)(rates[CH_YAW]*100));
+  display.setCursor(0, 35);
+  display.printf("Pitch:    %3d%%", (int)(rates[CH_PITCH]*100));
+  display.setCursor(0, 45);
+  display.printf("Roll:     %3d%%", (int)(rates[CH_ROLL]*100));
   
   display.display();
 }
 
 void loop() {
-  // --- ODCZYT I MAPOWANIE ---
-  int16_t raw0 = ads.readADC_SingleEnded(0);
-  int16_t raw1 = ads.readADC_SingleEnded(1);
-  int16_t raw2 = ads.readADC_SingleEnded(2);
-  int16_t raw3 = ads.readADC_SingleEnded(3);
-
-  myData.throttle = constrain(mapAxis(raw0, axis[0], false) + trim[CH_THROTTLE], RC_MIN, RC_MAX);
-  myData.yaw      = constrain(mapAxis(raw1, axis[1], true ) + trim[CH_YAW],      RC_MIN, RC_MAX);
-  myData.roll     = constrain(mapAxis(raw2, axis[2], true ) + trim[CH_ROLL],     RC_MIN, RC_MAX);
-  myData.pitch    = constrain(mapAxis(raw3, axis[3], true ) + trim[CH_PITCH],    RC_MIN, RC_MAX);
-
-  // --- WYSYŁANIE ESP-NOW ---
-  esp_err_t result = esp_now_send(receiverAddress, (uint8_t *) &myData, sizeof(myData));
-
-  // --- OBSŁUGA PRZYCISKÓW Z DEBOUNCINGIEM ---
+  unsigned long currentMillis = millis();
+  
+  currentScreen = ((encoderPos % MAX_SCREENS) + MAX_SCREENS) % MAX_SCREENS;  // ← POPRAWIONE
   checkButtons();
 
-  // --- AKTUALIZACJA WYŚWIETLACZA (Nieblokująca) ---
+  if (currentMillis - lastSendTime >= sendInterval) {
+    myData.throttle = processAxis(CH_THROTTLE);
+    myData.yaw      = processAxis(CH_YAW);
+    myData.roll     = processAxis(CH_ROLL);
+    myData.pitch    = processAxis(CH_PITCH);
+    esp_now_send(receiverAddress, (uint8_t *) &myData, sizeof(myData));
+    lastSendTime = currentMillis;
+  }
+
   if (millis() - lastDisplayUpdate > displayInterval) {
-    updateOLED();
+    switch(currentScreen) {
+      case 0: drawMainScreen(); break;
+      case 1: drawTrimScreen(); break;
+      case 2: drawRateScreen(); break;
+    }
+    // Usunięte duplikujące display.clearDisplay() i display.display()
     lastDisplayUpdate = millis();
   }
 }
